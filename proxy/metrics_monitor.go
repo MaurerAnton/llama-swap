@@ -245,6 +245,67 @@ func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 	return json.Marshal(result)
 }
 
+// DailyModelStats holds aggregated token counts for a single model for one day.
+type DailyModelStats struct {
+	CachedInputTokens int64 `json:"cached_input_tokens"`
+	FreshInputTokens  int64 `json:"fresh_input_tokens"`
+	OutputTokens      int64 `json:"output_tokens"`
+}
+
+// DailyStatsResponse is the JSON response for the daily metrics API.
+type DailyStatsResponse struct {
+	Date   string                     `json:"date"`
+	Models map[string]DailyModelStats `json:"models"`
+}
+
+// getDailyMetrics aggregates metrics for the last full calendar day grouped by model.
+// The date is determined from the server's local timezone.
+func (mp *metricsMonitor) getDailyMetrics() DailyStatsResponse {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	now := time.Now()
+	year, month, day := now.Date()
+	yesterday := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+	dayStart := yesterday.Add(-24 * time.Hour)
+	dayEnd := yesterday
+
+	models := make(map[string]DailyModelStats)
+
+	allMetrics := mp.metrics.Slice()
+	if allMetrics == nil {
+		return DailyStatsResponse{
+			Date:   dayStart.Format("2006-01-02"),
+			Models: models,
+		}
+	}
+
+	for _, m := range allMetrics {
+		if m.Timestamp.Before(dayStart) || !m.Timestamp.Before(dayEnd) {
+			continue
+		}
+
+		stats := models[m.Model]
+
+		if m.Tokens.CachedTokens > 0 {
+			stats.CachedInputTokens += int64(m.Tokens.CachedTokens)
+		}
+		if m.Tokens.InputTokens > 0 {
+			stats.FreshInputTokens += int64(m.Tokens.InputTokens)
+		}
+		if m.Tokens.OutputTokens > 0 {
+			stats.OutputTokens += int64(m.Tokens.OutputTokens)
+		}
+
+		models[m.Model] = stats
+	}
+
+	return DailyStatsResponse{
+		Date:   dayStart.Format("2006-01-02"),
+		Models: models,
+	}
+}
+
 // Capture field flags for controlling what is saved in ReqRespCapture.
 type captureFields uint
 
