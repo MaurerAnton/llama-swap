@@ -86,9 +86,9 @@ func main() {
 
 	// Set default ports.
 	if *listenStr == "" {
-		defaultPort := ":8080"
+		defaultPort := "127.0.0.1:8080"
 		if useTLS {
-			defaultPort = ":8443"
+			defaultPort = "127.0.0.1:8443"
 		}
 		listenStr = &defaultPort
 	}

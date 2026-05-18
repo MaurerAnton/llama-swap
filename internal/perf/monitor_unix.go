@@ -144,6 +144,11 @@ func tryNvidiaSmi(ctx context.Context, every time.Duration, logger *logmon.Monit
 		return nil, fmt.Errorf("nvidia-smi stdout pipe failed: %w", err)
 	}
 
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("nvidia-smi stderr pipe failed: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("nvidia-smi start failed: %w", err)
 	}
@@ -152,6 +157,16 @@ func tryNvidiaSmi(ctx context.Context, every time.Duration, logger *logmon.Monit
 
 	go func() {
 		defer close(ch)
+
+		go func() {
+			s := bufio.NewScanner(stderr)
+			for s.Scan() {
+				line := strings.TrimSpace(s.Text())
+				if line != "" {
+					logger.Warnf("nvidia-smi: %s", line)
+				}
+			}
+		}()
 
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
@@ -168,7 +183,14 @@ func tryNvidiaSmi(ctx context.Context, every time.Duration, logger *logmon.Monit
 				}
 			}
 		}
-		cmd.Wait()
+
+		if err := scanner.Err(); err != nil {
+			logger.Errorf("nvidia-smi scanner error: %s", err.Error())
+		}
+
+		if err := cmd.Wait(); err != nil {
+			logger.Errorf("nvidia-smi exited: %s", err.Error())
+		}
 	}()
 
 	return ch, nil

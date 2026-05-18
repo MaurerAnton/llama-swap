@@ -1544,3 +1544,143 @@ peers:
 	assert.Equal(t, 1, peerConfig.Timeouts.ExpectContinue)
 	assert.Equal(t, 90, peerConfig.Timeouts.IdleConn)
 }
+
+func TestConfig_ModelInheritance_Basic(t *testing.T) {
+	content := `
+models:
+  base:
+    cmd: /path/to/server -m model.gguf --ctx-size 2048
+    proxy: "http://localhost:8080"
+    checkEndpoint: "/health"
+    env: ["CUDA_VISIBLE_DEVICES=0"]
+    ttl: 300
+  derived:
+    inherit: base
+    cmd: /path/to/server -m model.gguf --ctx-size 16384
+`
+	conf, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+
+	assert.Len(t, conf.Models, 2)
+
+	base := conf.Models["base"]
+	assert.Equal(t, "/path/to/server -m model.gguf --ctx-size 2048", base.Cmd)
+	assert.Equal(t, "http://localhost:8080", base.Proxy)
+
+	derived := conf.Models["derived"]
+	assert.Equal(t, "/path/to/server -m model.gguf --ctx-size 16384", derived.Cmd)
+	assert.Equal(t, "http://localhost:8080", derived.Proxy)
+	assert.Equal(t, "/health", derived.CheckEndpoint)
+	assert.Equal(t, 300, derived.UnloadAfter)
+	assert.Equal(t, []string{"CUDA_VISIBLE_DEVICES=0"}, derived.Env)
+}
+
+func TestConfig_ModelInheritance_Circular(t *testing.T) {
+	content := `
+models:
+  a:
+    inherit: b
+  b:
+    inherit: a
+`
+	_, err := LoadConfigFromReader(strings.NewReader(content))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "circular inheritance")
+}
+
+func TestConfig_ModelInheritance_Self(t *testing.T) {
+	content := `
+models:
+  a:
+    inherit: a
+`
+	_, err := LoadConfigFromReader(strings.NewReader(content))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot inherit from itself")
+}
+
+func TestConfig_ModelInheritance_MissingBase(t *testing.T) {
+	content := `
+models:
+  derived:
+    inherit: nonexistent
+`
+	_, err := LoadConfigFromReader(strings.NewReader(content))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "base model nonexistent not found")
+}
+
+func TestConfig_ModelInheritance_AliasesNotInherited(t *testing.T) {
+	content := `
+models:
+  base:
+    cmd: /path/to/server -m model.gguf
+    proxy: "http://localhost:8080"
+    aliases: ["base-alias"]
+  derived:
+    inherit: base
+    cmd: /path/to/server -m model.gguf --ctx-size 8192
+`
+	conf, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+
+	base := conf.Models["base"]
+	assert.Contains(t, base.Aliases, "base-alias")
+
+	derived := conf.Models["derived"]
+	assert.Empty(t, derived.Aliases, "aliases should not be inherited from base")
+}
+
+func TestConfig_ModelInheritance_ExplicitAliasesPreserved(t *testing.T) {
+	content := `
+models:
+  base:
+    cmd: /path/to/server -m model.gguf
+    proxy: "http://localhost:8080"
+    aliases: ["base-alias"]
+  derived:
+    inherit: base
+    aliases: ["derived-alias"]
+`
+	conf, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+
+	derived := conf.Models["derived"]
+	assert.Equal(t, []string{"derived-alias"}, derived.Aliases)
+}
+
+func TestConfig_ModelInheritance_Transitive(t *testing.T) {
+	content := `
+models:
+  a:
+    cmd: /path/to/server -m a.gguf
+    proxy: "http://localhost:8080"
+    env: ["CUDA_VISIBLE_DEVICES=0"]
+  b:
+    inherit: a
+    proxy: "http://localhost:8081"
+  c:
+    inherit: b
+    cmd: /path/to/server -m c.gguf
+`
+	conf, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+
+	c := conf.Models["c"]
+	assert.Equal(t, "/path/to/server -m c.gguf", c.Cmd)
+	assert.Equal(t, "http://localhost:8081", c.Proxy)
+	assert.Equal(t, []string{"CUDA_VISIBLE_DEVICES=0"}, c.Env)
+}
+
+func TestConfig_ModelInheritance_NoInheritField(t *testing.T) {
+	content := `
+models:
+  standalone:
+    cmd: /path/to/server -m model.gguf
+    proxy: "http://localhost:8080"
+`
+	conf, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+	assert.Len(t, conf.Models, 1)
+	assert.Equal(t, "/path/to/server -m model.gguf", conf.Models["standalone"].Cmd)
+}

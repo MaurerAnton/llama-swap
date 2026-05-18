@@ -600,7 +600,7 @@ func TestMetricsMonitor_ParseMetrics(t *testing.T) {
 			"predicted_ms": 15.0
 		}`)
 
-		metrics, err := parseMetrics("test-model", start, usage, timings)
+		metrics, err := parseMetrics("test-model", start, []gjson.Result{usage}, []gjson.Result{timings})
 		assert.NoError(t, err)
 		assert.Equal(t, 5, metrics.Tokens.InputTokens)
 		assert.Equal(t, 1, metrics.Tokens.OutputTokens)
@@ -1385,5 +1385,108 @@ func TestMetricsMonitor_WrapHandler_PartialCaptures(t *testing.T) {
 		assert.Nil(t, capture.ReqBody)
 		assert.Nil(t, capture.RespHeaders)
 		assert.Equal(t, []byte(responseBody), capture.RespBody)
+	})
+}
+
+func TestMetricsMonitor_GetDailyMetrics(t *testing.T) {
+	t.Run("empty metrics returns zero stats", func(t *testing.T) {
+		mm := newMetricsMonitor(testLogger, 10, 0)
+		result := mm.getDailyMetrics()
+		assert.NotEmpty(t, result.Date)
+		assert.Empty(t, result.Models)
+	})
+
+	t.Run("aggregates metrics for yesterday by model", func(t *testing.T) {
+		mm := newMetricsMonitor(testLogger, 100, 0)
+
+		now := time.Now()
+		year, month, day := now.Date()
+		today := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+		yesterday := today.Add(-24 * time.Hour)
+
+		mm.mu.Lock()
+		mm.metrics.Push(ActivityLogEntry{
+			Timestamp: yesterday.Add(1 * time.Hour),
+			Model:     "model-a",
+			Tokens:    TokenMetrics{CachedTokens: 100, InputTokens: 200, OutputTokens: 50},
+		})
+		mm.metrics.Push(ActivityLogEntry{
+			Timestamp: yesterday.Add(2 * time.Hour),
+			Model:     "model-a",
+			Tokens:    TokenMetrics{CachedTokens: 50, InputTokens: 100, OutputTokens: 25},
+		})
+		mm.metrics.Push(ActivityLogEntry{
+			Timestamp: yesterday.Add(3 * time.Hour),
+			Model:     "model-b",
+			Tokens:    TokenMetrics{CachedTokens: 10, InputTokens: 90, OutputTokens: 30},
+		})
+		mm.metrics.Push(ActivityLogEntry{
+			Timestamp: today, // today - should be excluded
+			Model:     "model-a",
+			Tokens:    TokenMetrics{CachedTokens: 999, InputTokens: 999, OutputTokens: 999},
+		})
+		mm.mu.Unlock()
+
+		result := mm.getDailyMetrics()
+		assert.Equal(t, yesterday.Format("2006-01-02"), result.Date)
+		assert.Len(t, result.Models, 2)
+
+		assert.Equal(t, int64(150), result.Models["model-a"].CachedInputTokens)
+		assert.Equal(t, int64(300), result.Models["model-a"].FreshInputTokens)
+		assert.Equal(t, int64(75), result.Models["model-a"].OutputTokens)
+
+		assert.Equal(t, int64(10), result.Models["model-b"].CachedInputTokens)
+		assert.Equal(t, int64(90), result.Models["model-b"].FreshInputTokens)
+		assert.Equal(t, int64(30), result.Models["model-b"].OutputTokens)
+	})
+
+	t.Run("skips old entries before yesterday", func(t *testing.T) {
+		mm := newMetricsMonitor(testLogger, 100, 0)
+
+		now := time.Now()
+		year, month, day := now.Date()
+		today := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+		yesterday := today.Add(-24 * time.Hour)
+		twoDaysAgo := today.Add(-48 * time.Hour)
+
+		mm.mu.Lock()
+		mm.metrics.Push(ActivityLogEntry{
+			Timestamp: twoDaysAgo,
+			Model:     "model-c",
+			Tokens:    TokenMetrics{CachedTokens: 500, InputTokens: 1000, OutputTokens: 200},
+		})
+		mm.metrics.Push(ActivityLogEntry{
+			Timestamp: yesterday,
+			Model:     "model-d",
+			Tokens:    TokenMetrics{CachedTokens: 1, InputTokens: 2, OutputTokens: 3},
+		})
+		mm.mu.Unlock()
+
+		result := mm.getDailyMetrics()
+		assert.Len(t, result.Models, 1)
+		assert.Contains(t, result.Models, "model-d")
+		assert.NotContains(t, result.Models, "model-c")
+	})
+
+	t.Run("handles negative CachedTokens as zero", func(t *testing.T) {
+		mm := newMetricsMonitor(testLogger, 100, 0)
+
+		now := time.Now()
+		year, month, day := now.Date()
+		today := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+		yesterday := today.Add(-24 * time.Hour)
+
+		mm.mu.Lock()
+		mm.metrics.Push(ActivityLogEntry{
+			Timestamp: yesterday,
+			Model:     "model-e",
+			Tokens:    TokenMetrics{CachedTokens: -1, InputTokens: 100, OutputTokens: 50},
+		})
+		mm.mu.Unlock()
+
+		result := mm.getDailyMetrics()
+		assert.Equal(t, int64(0), result.Models["model-e"].CachedInputTokens)
+		assert.Equal(t, int64(100), result.Models["model-e"].FreshInputTokens)
+		assert.Equal(t, int64(50), result.Models["model-e"].OutputTokens)
 	})
 }

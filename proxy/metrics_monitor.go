@@ -245,6 +245,67 @@ func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 	return json.Marshal(result)
 }
 
+// DailyModelStats holds aggregated token counts for a single model for one day.
+type DailyModelStats struct {
+	CachedInputTokens int64 `json:"cached_input_tokens"`
+	FreshInputTokens  int64 `json:"fresh_input_tokens"`
+	OutputTokens      int64 `json:"output_tokens"`
+}
+
+// DailyStatsResponse is the JSON response for the daily metrics API.
+type DailyStatsResponse struct {
+	Date   string                     `json:"date"`
+	Models map[string]DailyModelStats `json:"models"`
+}
+
+// getDailyMetrics aggregates metrics for the last full calendar day grouped by model.
+// The date is determined from the server's local timezone.
+func (mp *metricsMonitor) getDailyMetrics() DailyStatsResponse {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	now := time.Now()
+	year, month, day := now.Date()
+	yesterday := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+	dayStart := yesterday.Add(-24 * time.Hour)
+	dayEnd := yesterday
+
+	models := make(map[string]DailyModelStats)
+
+	allMetrics := mp.metrics.Slice()
+	if allMetrics == nil {
+		return DailyStatsResponse{
+			Date:   dayStart.Format("2006-01-02"),
+			Models: models,
+		}
+	}
+
+	for _, m := range allMetrics {
+		if m.Timestamp.Before(dayStart) || !m.Timestamp.Before(dayEnd) {
+			continue
+		}
+
+		stats := models[m.Model]
+
+		if m.Tokens.CachedTokens > 0 {
+			stats.CachedInputTokens += int64(m.Tokens.CachedTokens)
+		}
+		if m.Tokens.InputTokens > 0 {
+			stats.FreshInputTokens += int64(m.Tokens.InputTokens)
+		}
+		if m.Tokens.OutputTokens > 0 {
+			stats.OutputTokens += int64(m.Tokens.OutputTokens)
+		}
+
+		models[m.Model] = stats
+	}
+
+	return DailyStatsResponse{
+		Date:   dayStart.Format("2006-01-02"),
+		Models: models,
+	}
+}
+
 // Capture field flags for controlling what is saved in ReqRespCapture.
 type captureFields uint
 
@@ -369,7 +430,7 @@ func (mp *metricsMonitor) wrapHandler(
 			}
 
 			if usage.Exists() || timings.Exists() {
-				if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), usage, timings); err != nil {
+				if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), []gjson.Result{usage}, []gjson.Result{timings}); err != nil {
 					mp.logger.Warnf("error parsing metrics: %v, path=%s, recording minimal metrics", err, request.URL.Path)
 				} else {
 					tm.Tokens = parsedMetrics.Tokens
@@ -425,28 +486,30 @@ func (mp *metricsMonitor) wrapHandler(
 }
 
 func processStreamingResponse(modelID string, start time.Time, body []byte) (ActivityLogEntry, error) {
-	// Iterate **backwards** through the body looking for the data payload with
-	// usage data. This avoids allocating a slice of all lines via bytes.Split.
+	// Scan all SSE data lines for usage and timing information.
+	// Collect from all events since some APIs (e.g. Anthropic) split usage
+	// across message_start (input_tokens, cache_read_input_tokens) and
+	// message_delta (output_tokens) events.
 
-	// Start from the end of the body and scan backwards for newlines
+	var usages []gjson.Result
+	var timingsList []gjson.Result
+
 	pos := len(body)
 	for pos > 0 {
-		// Find the previous newline (or start of body)
 		lineStart := bytes.LastIndexByte(body[:pos], '\n')
 		if lineStart == -1 {
 			lineStart = 0
 		} else {
-			lineStart++ // Move past the newline
+			lineStart++
 		}
 
 		line := bytes.TrimSpace(body[lineStart:pos])
-		pos = lineStart - 1 // Move position before the newline for next iteration
+		pos = lineStart - 1
 
 		if len(line) == 0 {
 			continue
 		}
 
-		// SSE payload always follows "data:"
 		prefix := []byte("data:")
 		if !bytes.HasPrefix(line, prefix) {
 			continue
@@ -458,7 +521,6 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 		}
 
 		if bytes.Equal(data, []byte("[DONE]")) {
-			// [DONE] line itself contains nothing of interest.
 			continue
 		}
 
@@ -472,51 +534,68 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 				usage = parsed.Get("response.usage")
 			}
 
-			if usage.Exists() || timings.Exists() {
-				return parseMetrics(modelID, start, usage, timings)
+			// Anthropic message_start nests usage under message.usage
+			if !usage.Exists() {
+				usage = parsed.Get("message.usage")
+			}
+
+			if usage.Exists() {
+				usages = append(usages, usage)
+			}
+			if timings.Exists() {
+				timingsList = append(timingsList, timings)
 			}
 		}
 	}
 
-	return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
+	if len(usages) == 0 && len(timingsList) == 0 {
+		return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
+	}
+
+	return parseMetrics(modelID, start, usages, timingsList)
 }
 
-func parseMetrics(modelID string, start time.Time, usage, timings gjson.Result) (ActivityLogEntry, error) {
+func parseMetrics(modelID string, start time.Time, usages []gjson.Result, timingsList []gjson.Result) (ActivityLogEntry, error) {
 	wallDurationMs := int(time.Since(start).Milliseconds())
 
-	// default values
-	cachedTokens := -1 // unknown or missing data
+	cachedTokens := -1
 	outputTokens := 0
 	inputTokens := 0
 
-	// timings data
+	for _, usage := range usages {
+		if !usage.Exists() {
+			continue
+		}
+
+		if inputTokens == 0 {
+			if pt := usage.Get("prompt_tokens"); pt.Exists() {
+				inputTokens = int(pt.Int())
+			} else if it := usage.Get("input_tokens"); it.Exists() {
+				inputTokens = int(it.Int())
+			}
+		}
+
+		if outputTokens == 0 {
+			if ct := usage.Get("completion_tokens"); ct.Exists() {
+				outputTokens = int(ct.Int())
+			} else if ot := usage.Get("output_tokens"); ot.Exists() {
+				outputTokens = int(ot.Int())
+			}
+		}
+
+		if cachedTokens < 0 {
+			if ct := usage.Get("cache_read_input_tokens"); ct.Exists() {
+				cachedTokens = int(ct.Int())
+			}
+		}
+	}
+
 	tokensPerSecond := -1.0
 	promptPerSecond := -1.0
 	durationMs := wallDurationMs
 
-	if usage.Exists() {
-		if pt := usage.Get("prompt_tokens"); pt.Exists() {
-			// v1/chat/completions
-			inputTokens = int(pt.Int())
-		} else if it := usage.Get("input_tokens"); it.Exists() {
-			// v1/messages
-			inputTokens = int(it.Int())
-		}
-
-		if ct := usage.Get("completion_tokens"); ct.Exists() {
-			// v1/chat/completions
-			outputTokens = int(ct.Int())
-		} else if ot := usage.Get("output_tokens"); ot.Exists() {
-			outputTokens = int(ot.Int())
-		}
-
-		if ct := usage.Get("cache_read_input_tokens"); ct.Exists() {
-			cachedTokens = int(ct.Int())
-		}
-	}
-
-	// use llama-server's timing data for tok/sec and duration as it is more accurate
-	if timings.Exists() {
+	if len(timingsList) > 0 {
+		timings := timingsList[len(timingsList)-1]
 		inputTokens = int(timings.Get("prompt_n").Int())
 		outputTokens = int(timings.Get("predicted_n").Int())
 		promptPerSecond = timings.Get("prompt_per_second").Float()

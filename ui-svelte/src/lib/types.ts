@@ -132,6 +132,17 @@ export interface ChatMessage {
   reasoningTimeMs?: number;
 }
 
+export interface ChatSession {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messages: ChatMessage[];
+  model?: string;
+  systemPrompt?: string;
+  temperature?: number;
+}
+
 export function getTextContent(content: string | ContentPart[]): string {
   if (typeof content === "string") {
     return content;

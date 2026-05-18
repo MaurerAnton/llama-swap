@@ -247,6 +247,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("logToStdout must be one of: proxy, upstream, both, none")
 	}
 
+	if err := resolveModelInheritance(&config, yamlStr); err != nil {
+		return Config{}, err
+	}
+
 	// Populate the aliases map
 	config.aliases = make(map[string]string)
 	for modelName, modelConfig := range config.Models {
@@ -827,4 +831,92 @@ func sanitizeEnvValueForYAML(value, varName string) (string, error) {
 	value = strings.ReplaceAll(value, `"`, `\"`)
 
 	return value, nil
+}
+
+func resolveModelInheritance(config *Config, yamlStr string) error {
+	var rawConfig struct {
+		Models map[string]map[string]any `yaml:"models"`
+	}
+	if err := yaml.Unmarshal([]byte(yamlStr), &rawConfig); err != nil {
+		return err
+	}
+
+	for modelID := range config.Models {
+		rawModel, ok := rawConfig.Models[modelID]
+		if !ok {
+			continue
+		}
+		if _, hasInherit := rawModel["inherit"]; !hasInherit {
+			continue
+		}
+
+		merged, err := resolveInheritChain(modelID, rawConfig.Models, make(map[string]bool))
+		if err != nil {
+			return err
+		}
+
+		delete(merged, "inherit")
+
+		mergedBytes, err := yaml.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("model %s: %w", modelID, err)
+		}
+
+		var inherited ModelConfig
+		if err := yaml.Unmarshal(mergedBytes, &inherited); err != nil {
+			return fmt.Errorf("model %s: %w", modelID, err)
+		}
+
+		config.Models[modelID] = inherited
+	}
+
+	return nil
+}
+
+func resolveInheritChain(modelID string, rawModels map[string]map[string]any, visited map[string]bool) (map[string]any, error) {
+	if visited[modelID] {
+		return nil, fmt.Errorf("circular inheritance detected for model %s", modelID)
+	}
+	visited[modelID] = true
+
+	rawModel, ok := rawModels[modelID]
+	if !ok {
+		return nil, fmt.Errorf("model %s not found in raw config", modelID)
+	}
+
+	inheritVal, hasInherit := rawModel["inherit"]
+	if !hasInherit {
+		return rawModel, nil
+	}
+
+	baseID, ok := inheritVal.(string)
+	if !ok {
+		return nil, fmt.Errorf("model %s: inherit must be a string", modelID)
+	}
+
+	if baseID == modelID {
+		return nil, fmt.Errorf("model %s: cannot inherit from itself", modelID)
+	}
+
+	if _, exists := rawModels[baseID]; !exists {
+		return nil, fmt.Errorf("model %s: base model %s not found", modelID, baseID)
+	}
+
+	baseRaw, err := resolveInheritChain(baseID, rawModels, visited)
+	if err != nil {
+		return nil, err
+	}
+
+	merged := make(map[string]any)
+	for k, v := range baseRaw {
+		if k == "aliases" || k == "inherit" || k == "unlisted" {
+			continue
+		}
+		merged[k] = v
+	}
+	for k, v := range rawModel {
+		merged[k] = v
+	}
+
+	return merged, nil
 }

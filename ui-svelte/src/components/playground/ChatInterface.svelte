@@ -3,22 +3,19 @@
   import { persistentStore } from "../../stores/persistent";
   import { streamChatCompletion } from "../../lib/chatApi";
   import { playgroundStores } from "../../stores/playgroundActivity";
+  import { currentSessionId, newSession, updateCurrentSession, getCurrentSession, saveSessionById } from "../../stores/chatHistory";
   import type { ChatMessage, ContentPart } from "../../lib/types";
   import ChatMessageComponent from "./ChatMessage.svelte";
   import ModelSelector from "./ModelSelector.svelte";
   import ExpandableTextarea from "./ExpandableTextarea.svelte";
+  import ChatHistorySidebar from "./ChatHistorySidebar.svelte";
 
   const selectedModelStore = persistentStore<string>("playground-selected-model", "");
   const systemPromptStore = persistentStore<string>("playground-system-prompt", "");
   const temperatureStore = persistentStore<number>("playground-temperature", 0.7);
 
   function loadMessages(): ChatMessage[] {
-    try {
-      const saved = localStorage.getItem("playground-messages");
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
+    return getCurrentSession()?.messages ?? [];
   }
 
   let messages = $state<ChatMessage[]>(loadMessages());
@@ -35,6 +32,32 @@
 
   let hasModels = $derived($models.some((m) => !m.unlisted));
   let userScrolledUp = $state(false);
+
+  // Load session state when switching
+  let activeSessionId = $state("");
+  $effect(() => {
+    const sid = $currentSessionId;
+    if (!sid || sid === activeSessionId) return;
+    // Save the PREVIOUS session's messages by its old ID
+    if (activeSessionId) {
+      saveSessionById(activeSessionId, messages, $selectedModelStore, $systemPromptStore, $temperatureStore);
+    }
+    activeSessionId = sid;
+    const session = getCurrentSession();
+    if (session) {
+      messages = session.messages ?? [];
+      if (session.model) $selectedModelStore = session.model;
+      if (session.systemPrompt !== undefined) $systemPromptStore = session.systemPrompt;
+      if (session.temperature !== undefined) $temperatureStore = session.temperature;
+    } else {
+      messages = [];
+    }
+    isStreaming = false;
+    isReasoning = false;
+    userScrolledUp = false;
+    lastSaveTime = Date.now();
+    saveEpoch++;
+  });
 
   $effect(() => {
     playgroundStores.chatStreaming.set(isStreaming);
@@ -57,13 +80,16 @@
     }
   });
 
-  // Persist messages to localStorage (throttled to once per 2s)
+  // Persist messages to session store (throttled to once per 2s)
+  // Guarded by session epoch to prevent stale saves after session switch
   let lastSaveTime = 0;
+  let saveEpoch = 0;
   $effect(() => {
-    const json = JSON.stringify(messages);
+    const epoch = ++saveEpoch;
     const elapsed = Date.now() - lastSaveTime;
     const save = () => {
-      try { localStorage.setItem("playground-messages", json); } catch {}
+      if (epoch !== saveEpoch) return; // session switched, discard
+      updateCurrentSession(messages, $selectedModelStore, $systemPromptStore, $temperatureStore);
       lastSaveTime = Date.now();
     };
     if (elapsed >= 2000) {
@@ -109,13 +135,11 @@
     abortController?.abort();
   }
 
-  function newChat() {
+  async function newChat() {
     if (isStreaming) {
       cancelStreaming();
     }
-    messages = [];
-    isReasoning = false;
-    reasoningStartTime = 0;
+    await newSession();
   }
 
   async function regenerateFromIndex(idx: number) {
@@ -296,7 +320,10 @@
   }
 </script>
 
-<div class="flex flex-col h-full">
+<div class="flex h-full">
+  <ChatHistorySidebar />
+
+  <div class="flex flex-col flex-1 min-w-0 h-full">
   <!-- Model selector and controls -->
   <div class="shrink-0 flex flex-wrap gap-2 mb-4">
     <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={isStreaming} />
@@ -463,4 +490,5 @@
       </div>
     </div>
   {/if}
+  </div>
 </div>

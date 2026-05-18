@@ -30,6 +30,7 @@ type ModelConfig struct {
 	UnloadAfter   int      `yaml:"ttl"`
 	Unlisted      bool     `yaml:"unlisted"`
 	UseModelName  string   `yaml:"useModelName"`
+	Inherit       string   `yaml:"inherit"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`

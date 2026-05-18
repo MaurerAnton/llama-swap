@@ -34,6 +34,7 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.POST("/models/unload/*model", pm.apiUnloadSingleModelHandler)
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
+		apiGroup.GET("/metrics/daily", pm.apiGetDailyMetrics)
 		apiGroup.GET("/performance", pm.apiGetPerformance)
 		apiGroup.GET("/version", pm.apiGetVersion)
 		apiGroup.GET("/captures/:id", pm.apiGetCapture)
@@ -248,6 +249,11 @@ func (pm *ProxyManager) apiGetMetrics(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "application/json", jsonData)
+}
+
+func (pm *ProxyManager) apiGetDailyMetrics(c *gin.Context) {
+	stats := pm.metricsMonitor.getDailyMetrics()
+	c.JSON(http.StatusOK, stats)
 }
 
 func (pm *ProxyManager) prometheusMetricsHandler(c *gin.Context) {
